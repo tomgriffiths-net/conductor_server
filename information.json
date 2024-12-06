@@ -1,0 +1,12 @@
+{
+    "dependencies": {
+        "communicator": 4,
+        "network": 1,
+        "settings": 2
+    },
+    "id_name": "conductor_server",
+    "version": 6,
+    "author": "tom",
+    "name": "Conductor Server",
+    "description": ""
+}
