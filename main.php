@@ -19,12 +19,13 @@ class conductor_server{
 
         stream_set_timeout($socket,5);
 
-        $jobs = self::loadJobs();
-
         while(true){
             $break = false;
             $clientSocket = communicator::acceptConnection($socket,5);
             if($clientSocket){
+
+                $jobs = self::loadJobs();
+
                 $startTime = time::millistamp();
                 $tempconid = date("Y-m-d H:i:s");
                 //echo "$tempconid: Received connection\n";
@@ -115,8 +116,10 @@ class conductor_server{
                 communicator::close($clientSocket);
 
                 if(!self::saveJobs($jobs)){
-                    mklog('warning',"Unable to save jobs data",false);
+                    mklog('error',"Unable to save jobs data",false);
+                    break;
                 }
+                unset($jobs);
 
                 if($timeTaken > 2){
                     echo "$tempconid: Warning: Last request took longer than 2 seconds\n";
