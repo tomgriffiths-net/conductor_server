@@ -371,6 +371,16 @@ class conductor_server{
         $response['success'] = true;
         return true;
     }
+    public static function numberOfJobs():int{
+        $return = 0;
+        foreach(self::loadJobs() as $job){
+            if($job['completed'] !== false || $job['requested'] !== false || $job['return'] !== null){
+                continue;
+            }
+            $return ++;
+        }
+        return $return;
+    }
     private static function loadJobs():array{
         $jobsFile = self::jobsFile();
         $json = json::readFile($jobsFile,false);
