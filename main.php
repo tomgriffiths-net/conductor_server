@@ -381,6 +381,9 @@ class conductor_server{
         }
         return $return;
     }
+    public static function numberOfTotalJobs():int{
+        return count(self::loadJobs());
+    }
     private static function loadJobs():array{
         $jobsFile = self::jobsFile();
         $json = json::readFile($jobsFile,false);
@@ -407,5 +410,61 @@ class conductor_server{
         foreach($defaultSettings as $name => $value){
             settings::set($name,$value,false);
         }
+    }
+    public static function filterJobs(string $expression, int $offset = 0, $recentFirst = false):array|false{
+        if(!preg_match('/^(?=.+)[a-zA-Z_$()!][a-zA-Z0-9_\[\].\s$(),"\'&|!<>=+-]*$/', $expression)){
+            return false;
+        }
+
+        $jobs = self::loadJobs();
+
+        $filtered = [];
+        $matches = 0;
+        $totals = [
+            'totaljobs' => count($jobs),
+            'taken' => 0,
+            'processing' => 0,
+            'completed' => 0,
+            'successful' => 0,
+            'failed' => 0
+        ];
+
+        if($recentFirst){
+            $jobs = array_reverse($jobs);
+        }
+
+        foreach($jobs as $jobnum => $job){
+            $jobnum++; //Remove starting at 0
+            try{
+                $count = count($filtered);
+                $taken = ($job['completed'] !== false || $job['requested'] !== false || $job['return'] !== null);
+                $processing = ($taken && !$job['completed']);
+                $completed = ($job['completed'] && $job['requested'] && $job['return'] !== null);
+                $successful = ($job['completed'] && $job['return'] && (!isset($job['finish_function']) || $job['finish_function_return']));
+                $failed = ($job['completed'] && !$successful);
+
+                if($taken){$totals['taken']++;}
+                if($processing){$totals['processing']++;}
+                if($completed){$totals['completed']++;}
+                if($successful){$totals['successful']++;}
+                if($failed){$totals['failed']++;}
+
+                if(eval('return (' . $expression . ');')){
+                    $matches++;
+                    if(($count + 1) > $offset){
+                        $filtered[] = $job;
+                    }
+                }
+            }
+            catch(\Error){
+                return false;
+            }
+        }
+
+        return [
+            'jobs' => $filtered,
+            'matches' => $matches,
+            'totals' => $totals
+        ];
     }
 }
