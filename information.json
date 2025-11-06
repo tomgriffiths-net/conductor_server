@@ -1,12 +1,13 @@
 {
+    "id_name": "conductor_server",
+    "name": "Conductor Server (Dev)",
+    "version": 10,
+    "author": "tom",
+    "description": "",
     "dependencies": {
         "communicator": 4,
         "network": 1,
-        "settings": 2
-    },
-    "id_name": "conductor_server",
-    "version": 9,
-    "author": "tom",
-    "name": "Conductor Server",
-    "description": ""
+        "settings": 2,
+        "math": 4
+    }
 }

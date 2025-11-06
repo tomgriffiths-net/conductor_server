@@ -1,8 +1,15 @@
 <?php
 class conductor_server{
-    public static function start(string $ip = "0.0.0.0", int $port = 52000):bool{
+    public static function init(){
+        settings::set("jobsFile", "conductor\\jobs.json", false);
+    }
+
+    public static function start(string $ip="0.0.0.0", int $port=52000):bool{
         //Start Socket Server
-        extensions::ensure('sockets');
+        if(!extension_ensure('sockets')){
+            mklog(2, 'Extension sockets needed to run conductor server');
+            return false;
+        }
 
         if(network::ping($ip,$port,1)){
             mklog('warning',"Unable to listen on $ip:$port as it is already in use",false);
@@ -134,7 +141,133 @@ class conductor_server{
 
         return $break;
     }
-    public static function getJob(string $name, $data, &$jobs, &$response):bool{
+    public static function numberOfJobs():int{
+        $jobNumbers = self::filterJobs(false);
+        if(!is_array($jobNumbers)){
+            return 0;
+        }
+        return $jobNumbers['pending'];
+    }
+    public static function numberOfTotalJobs():int{
+        $jobs = self::loadJobs();
+        if(!is_array($jobs)){
+            return 0;
+        }
+        return count($jobs);
+    }
+    public static function getJobTimes(int $jobScope=5):array|false{
+        $jobs = self::loadJobs();
+        if(!is_array($jobs) || !array_is_list($jobs)){
+            return false;
+        }
+
+        $jobTimes = [];
+        foreach($jobs as $jobIndex => $job){
+            if(!isset($job['request_time']) || !is_int($job['request_time']) || !isset($job['completion_time']) || !is_int($job['completion_time'])){
+                continue;
+            }
+
+            $timeTaken = $job['completion_time'] - $job['request_time'];
+
+            $jobTimes[] = $timeTaken;
+            if(count($jobTimes) > $jobScope){
+                array_shift($jobTimes);
+            }
+        }
+
+        if(empty($jobTimes)){
+            return false;
+        }
+
+        $averageJobTime = round(math::average($jobTimes));
+        $timeLeftEstimate = null;
+        $finishTimeEstimate = "Unknown";
+        $jobsPerDayEstimate = null;
+
+        $jobNumbers = self::filterJobs(false);
+
+        if($jobNumbers['processing'] > 0){
+            // Time for all pending jobs to complete add Time for currently processing jobs (on average, halfway done)
+            $timeLeftEstimate = round((($averageJobTime * $jobNumbers['pending']) / $jobNumbers['processing']) + ($averageJobTime / 2));
+            $finishTimeEstimate = date("Y-m-d H:i", time() + $timeLeftEstimate) . ":00";
+            $jobsPerDayEstimate = round(86400 / ($averageJobTime / $jobNumbers['processing']));
+        }
+
+        return [
+            'average_job_time' => $averageJobTime,
+            'time_left_estimate' => $timeLeftEstimate,
+            'finish_time_estimate' => $finishTimeEstimate,
+            'jobs_per_day_estimate' => $jobsPerDayEstimate
+        ];
+    }
+    public static function filterJobs(string|false $expression, int $offset=0, bool $recentFirst=false):array|false{
+        if(is_string($expression) && !preg_match('/^(?=.+)[a-zA-Z_$()!][a-zA-Z0-9_\[\].\s$(),"\'&|!<>=+-]*$/', $expression)){
+            return false;
+        }
+
+        $jobs = self::loadJobs();
+
+        $filtered = [];
+        $matches = 0;
+        $totals = [
+            'totaljobs' => count($jobs),
+            'taken' => 0,
+            'pending' => 0,
+            'processing' => 0,
+            'completed' => 0,
+            'successful' => 0,
+            'failed' => 0
+        ];
+
+        if($recentFirst){
+            $jobs = array_reverse($jobs);
+        }
+
+        foreach($jobs as $jobnum => $job){
+            $jobnum++; //Remove starting at 0
+            try{
+                $count = count($filtered);
+                $taken = ($job['completed'] !== false || $job['requested'] !== false || $job['return'] !== null);
+                $pending = !$taken;
+                $processing = ($taken && !$job['completed']);
+                $completed = ($job['completed'] && $job['requested'] && $job['return'] !== null);
+                $successful = ($job['completed'] && $job['return'] && (!isset($job['finish_function']) || $job['finish_function_return']));
+                $failed = ($job['completed'] && !$successful);
+
+                if($taken){$totals['taken']++;}
+                if($pending){$totals['pending']++;}
+                if($processing){$totals['processing']++;}
+                if($completed){$totals['completed']++;}
+                if($successful){$totals['successful']++;}
+                if($failed){$totals['failed']++;}
+
+                if(is_string($expression)){
+                    if(eval('return (' . $expression . ');')){
+                        $matches++;
+                        if(($count + 1) > $offset){
+                            $filtered[] = $job;
+                        }
+                    }
+                }
+            }
+            catch(\Error){
+                continue;
+            }
+        }
+
+        if(is_string($expression)){
+            return [
+                'jobs' => $filtered,
+                'matches' => $matches,
+                'totals' => $totals
+            ];
+        }
+        else{
+            return $totals;
+        }
+    }
+
+    private static function getJob(string $name, $data, &$jobs, &$response):bool{
         if(!is_array($data)){
             $response['error'] = "Data is not an array";
             return false;
@@ -166,7 +299,7 @@ class conductor_server{
             }
         }
 
-        $available = array();
+        $availableJob = null;
         foreach($jobs as $job){
             if($job['completed'] !== false || $job['requested'] !== false || $job['return'] !== null){
                 continue;
@@ -187,19 +320,21 @@ class conductor_server{
                 }
             }
             
-            $available[] = $job;
+            $availableJob = $job;
+            break;
         }
 
-        if(count($available) < 1){
+        if($availableJob === null){
             $response['message'] = "No jobs available";
         }
         else{
-            $response['job'] = $available[0];
+            $response['job'] = $availableJob;
 
             $requestedId = $response['job']['id'];
             foreach($jobs as $jobindex => $job){
                 if($job['id'] === $requestedId){
                     $jobs[$jobindex]['requested'] = true;
+                    $jobs[$jobindex]['request_time'] = time();
                     break;
                 }
             }
@@ -208,7 +343,7 @@ class conductor_server{
         $response['success'] = true;
         return true;
     }
-    public static function updateJob($jobData, &$jobs, &$response):bool{
+    private static function updateJob($jobData, &$jobs, &$response):bool{
         if(!is_array($jobData)){
             $response['error'] = "jobdata is not an array";
             return false;
@@ -252,11 +387,12 @@ class conductor_server{
                 $jobs[$jobindex]['return'] = $jobData['return'];
                 $jobs[$jobindex]['error_completing'] = $jobData['error_completing'];
                 $jobs[$jobindex]['completed'] = true;
+                $jobs[$jobindex]['completion_time'] = time();
 
                 // finish function
                 if(isset($jobs[$jobindex]['finish_function'])){
                     if(is_string($jobs[$jobindex]['finish_function'])){
-                        $return = false;
+                        $return = null;
                         $error = false;
                         try{
                             echo "Executing finish function: " . $jobs[$jobindex]['finish_function'] . "\n";
@@ -264,7 +400,7 @@ class conductor_server{
                         }
                         catch(Throwable $throwable){
                             $error = true;
-                            $return = false;
+                            $return = null;
                             mklog("warning", "Error running finish function: " . $jobs[$jobindex]['finish_function'] . ": " . explode("\n",$throwable)[0] . "\n", false);
                         }
 
@@ -290,7 +426,7 @@ class conductor_server{
         $response['success'] = true;
         return true;
     }
-    public static function addJob($jobData, &$jobs, &$response):bool{
+    private static function addJob($jobData, &$jobs, &$response):bool{
         if(!is_array($jobData)){
             $response['error'] = "Job data is not an array";
             return false;
@@ -314,12 +450,8 @@ class conductor_server{
                 $response['error'] = "requirement package id is invalid: " . $requirement;
                 return false;
             }
-            if(!is_int($version)){
-                $response['error'] = "requirement package version is not an integer: " . $version;
-                return false;
-            }
-            if($version < 1){
-                $response['error'] = "requirement package version is invalid: " . $version;
+            if(!is_int($version) || $version < 1){
+                $response['error'] = "requirement package version for " . $requirement . " is invalid: " . $version;
                 return false;
             }
         }
@@ -352,11 +484,13 @@ class conductor_server{
         $job['completed'] = false;
         $job['requested'] = false;
         $job['error_completing'] = false;
+        $job['request_time'] = null;
+        $job['completion_time'] = null;
 
         if(isset($jobData['finish_function'])){
             if(is_string($jobData['finish_function'])){
                 $job['finish_function'] = $jobData['finish_function'];
-                $job['finish_function_return'] = false;
+                $job['finish_function_return'] = null;
                 $job['finish_function_error'] = false;
             }
         }
@@ -370,19 +504,6 @@ class conductor_server{
         $response['job_id'] = $job['id'];
         $response['success'] = true;
         return true;
-    }
-    public static function numberOfJobs():int{
-        $return = 0;
-        foreach(self::loadJobs() as $job){
-            if($job['completed'] !== false || $job['requested'] !== false || $job['return'] !== null){
-                continue;
-            }
-            $return ++;
-        }
-        return $return;
-    }
-    public static function numberOfTotalJobs():int{
-        return count(self::loadJobs());
     }
     private static function loadJobs():array{
         $jobsFile = self::jobsFile();
@@ -402,69 +523,5 @@ class conductor_server{
             return $setting;
         }
         return "conductor\\jobs.json";
-    }
-    public static function init(){
-        $defaultSettings = array(
-            "jobsFile" => "conductor\\jobs.json",
-        );
-        foreach($defaultSettings as $name => $value){
-            settings::set($name,$value,false);
-        }
-    }
-    public static function filterJobs(string $expression, int $offset = 0, $recentFirst = false):array|false{
-        if(!preg_match('/^(?=.+)[a-zA-Z_$()!][a-zA-Z0-9_\[\].\s$(),"\'&|!<>=+-]*$/', $expression)){
-            return false;
-        }
-
-        $jobs = self::loadJobs();
-
-        $filtered = [];
-        $matches = 0;
-        $totals = [
-            'totaljobs' => count($jobs),
-            'taken' => 0,
-            'processing' => 0,
-            'completed' => 0,
-            'successful' => 0,
-            'failed' => 0
-        ];
-
-        if($recentFirst){
-            $jobs = array_reverse($jobs);
-        }
-
-        foreach($jobs as $jobnum => $job){
-            $jobnum++; //Remove starting at 0
-            try{
-                $count = count($filtered);
-                $taken = ($job['completed'] !== false || $job['requested'] !== false || $job['return'] !== null);
-                $processing = ($taken && !$job['completed']);
-                $completed = ($job['completed'] && $job['requested'] && $job['return'] !== null);
-                $successful = ($job['completed'] && $job['return'] && (!isset($job['finish_function']) || $job['finish_function_return']));
-                $failed = ($job['completed'] && !$successful);
-
-                if($taken){$totals['taken']++;}
-                if($processing){$totals['processing']++;}
-                if($completed){$totals['completed']++;}
-                if($successful){$totals['successful']++;}
-                if($failed){$totals['failed']++;}
-
-                if(eval('return (' . $expression . ');')){
-                    $matches++;
-                    if(($count + 1) > $offset){
-                        $filtered[] = $job;
-                    }
-                }
-            }
-            catch(\Error){
-                return false;
-            }
-        }
-
-        return [
-            'jobs' => $filtered,
-            'matches' => $matches,
-            'totals' => $totals
-        ];
     }
 }
