@@ -182,7 +182,7 @@ class conductor_server{
         $averageJobTime = round(math::average($jobTimes));
         $timeLeftEstimate = null;
         $finishTimeEstimate = "Unknown";
-        $jobsPerDayEstimate = null;
+        $jobsPerDayEstimate = 0;
 
         $jobNumbers = self::filterJobs(false);
 
