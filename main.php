@@ -4,165 +4,23 @@ class conductor_server{
         settings::set("jobsFile", "conductor\\jobs.json", false);
     }
 
-    public static function start(string $ip="0.0.0.0", int $port=52000):bool{
-        //Start Socket Server
-        if(!extension_ensure('sockets')){
-            mklog(2, 'Extension sockets needed to run conductor server');
-            return false;
-        }
-
-        if(network::ping($ip,$port,1)){
-            mklog('warning',"Unable to listen on $ip:$port as it is already in use",false);
-            return false;
-        }
-
-        $socket = communicator::createServer($ip,$port,false,$socketError,$socketErrorString);
-        if(!$socket){
-            mklog('warning',"Unable to listen on $ip:$port, $socketErrorString",false);
-            return false;
-        }
-        echo "Listening on $ip:$port\n";
-        exec('title Conductor Server ' . $port);
-
-        stream_set_timeout($socket,5);
-
-        while(true){
-            $break = false;
-            $clientSocket = communicator::acceptConnection($socket,5);
-            if($clientSocket){
-
-                $jobs = self::loadJobs();
-
-                $startTime = time::millistamp();
-                $tempconid = date("Y-m-d H:i:s");
-                //echo "$tempconid: Received connection\n";
-
-                $data = communicator::receive($clientSocket);
-                $data = json_decode(base64_decode($data),true);
-                $response = array("success" => false);
-
-                $required = array("type","payload","name","password");
-                foreach($required as $require){
-                    if(!isset($data[$require])){
-                        $response['error'] = "Missing data: " . $require;
-                        echo "$tempconid: Missing data: " . $require . "\n";
-                        goto respond;
-                    }
-                }
-
-                if(!is_string($data['name']) || empty($data['name'])){
-                    $response['error'] = "Invalid name";
-                }
-
-                if(!communicator::verifyPassword($data['password'])){
-                    $response['error'] = "Incorrect password";
-                    mklog("warning","Communicator: Incorrect passowrd submitted",false);
-                    goto respond;
-                }
-
-                /////
-                if($data["type"] === "requestJob"){
-                    if(!self::getJob($data['name'] ,$data['payload'], $jobs, $response)){
-                        if(!isset($response['error'])){
-                            $response['error'] = "Unknown error";
-                        }
-                        mklog("warning","Unable to get job info: " . $response['error'],false);
-                    }
-                    else{
-                        if(isset($response['job']['id'])){
-                            echo "$tempconid: Sent job " . $response['job']['id'] . " to " . $data['name'] . "\n";
-                        }
-                    }
-                }
-                elseif($data["type"] === "updateJob"){
-                    if(!self::updateJob($data['payload'], $jobs, $response)){
-                        if(!isset($response['error'])){
-                            $response['error'] = "Unknown error";
-                        }
-                        mklog("warning","Unable to update job: " . $response['error'],false);
-                    }
-                    else{
-                        echo "$tempconid: " . $data['name'] . " updated job " . $data['payload']['id'] . "\n";
-                    }
-                }
-                elseif($data["type"] === "addJob"){
-                    if(!self::addJob($data['payload'], $jobs, $response)){
-                        if(!isset($response['error'])){
-                            $response['error'] = "Unknown error";
-                        }
-                        mklog("warning","Unable to add job: " . $response['error'],false);
-                    }
-                    else{
-                        echo "$tempconid: " . $data['name'] . " created job " . $response['job_id'] . "\n";
-                    }
-                }
-                elseif($data["type"] === "listJobs"){
-                    $response['jobs'] = $jobs;
-                    $response['success'] = true;
-                    echo "$tempconid: " . $data['name'] . " listed all jobs\n";
-                }
-                elseif($data["type"] === "stop"){
-                    $break = true;
-                    $response['success'] = true;
-                    $response['message'] = "Closing conductor server";
-                    mklog('general','Conductor closed by request',false);
-                }
-                else{
-                    $response['error'] = "Action does not exist";
-                }
-
-                /////
-
-                respond:
-
-                $response = base64_encode(json_encode($response));
-                communicator::send($clientSocket,$response);
-
-                $timeTaken = (time::millistamp() - $startTime)/1000;
-                //echo $connid . ": Closing connection (" . $timeTaken . "s)\n";
-                communicator::close($clientSocket);
-
-                if(!self::saveJobs($jobs)){
-                    mklog('error',"Unable to save jobs data",false);
-                    break;
-                }
-                unset($jobs);
-
-                if($timeTaken > 2){
-                    echo "$tempconid: Warning: Last request took longer than 2 seconds\n";
-                }
-            }
-            
-            if($break){
-                break;
-            }
-        }
-        @communicator::close($socket);
-
-        return $break;
-    }
-    public static function numberOfJobs():int{
-        $jobNumbers = self::filterJobs(false);
-        if(!is_array($jobNumbers)){
-            return 0;
-        }
-        return $jobNumbers['pending'];
-    }
-    public static function numberOfTotalJobs():int{
-        $jobs = self::loadJobs();
-        if(!is_array($jobs)){
-            return 0;
-        }
-        return count($jobs);
-    }
-    public static function getJobTimes(int $jobScope=5):array|false{
-        $jobs = self::loadJobs();
-        if(!is_array($jobs) || !array_is_list($jobs)){
-            return false;
+    /**
+     * Calculates average job time and estimates, time left and jobs speed.
+     * @param int $jobScope How many jobs to include in the average.
+     * @return array An array containing a success boolean, job average time and speed/time left estimations, error message on failure.
+     */
+    public static function getJobTimes(int $jobScope=5):array{
+        $filter = self::filterJobs();
+        if(!$filter['success']){
+            mklog(2, "Failed to get jobs");
+            return [
+                'success' => false,
+                'error' => "Failed to get jobs"
+            ];
         }
 
         $jobTimes = [];
-        foreach($jobs as $jobIndex => $job){
+        foreach($filter['jobs'] as $job){
             if(!isset($job['request_time']) || !is_int($job['request_time']) || !isset($job['completion_time']) || !is_int($job['completion_time'])){
                 continue;
             }
@@ -176,7 +34,10 @@ class conductor_server{
         }
 
         if(empty($jobTimes)){
-            return false;
+            return [
+                'success' => false,
+                'error' => "Failed to determine average job time"
+            ];
         }
 
         $averageJobTime = round(math::average($jobTimes));
@@ -184,28 +45,42 @@ class conductor_server{
         $finishTimeEstimate = "Unknown";
         $jobsPerDayEstimate = 0;
 
-        $jobNumbers = self::filterJobs(false);
-
-        if($jobNumbers['processing'] > 0){
+        if($filter['totals']['processing'] > 0){
             // Time for all pending jobs to complete add Time for currently processing jobs (on average, halfway done)
-            $timeLeftEstimate = round((($averageJobTime * $jobNumbers['pending']) / $jobNumbers['processing']) + ($averageJobTime / 2));
+            $timeLeftEstimate = round((($averageJobTime * $filter['totals']['pending']) / $filter['totals']['processing']) + ($averageJobTime / 2));
             $finishTimeEstimate = date("Y-m-d H:i", time() + $timeLeftEstimate) . ":00";
-            $jobsPerDayEstimate = round(86400 / ($averageJobTime / $jobNumbers['processing']));
+            $jobsPerDayEstimate = round(86400 / ($averageJobTime / $filter['totals']['processing']));
         }
 
         return [
+            'success' => true,
             'average_job_time' => $averageJobTime,
             'time_left_estimate' => $timeLeftEstimate,
             'finish_time_estimate' => $finishTimeEstimate,
             'jobs_per_day_estimate' => $jobsPerDayEstimate
         ];
     }
-    public static function filterJobs(string|false $expression, int $offset=0, bool $recentFirst=false):array|false{
+    /**
+     * Filters jobs.
+     * @param null|string $expression An optional filter expression. Available variables: count, taken, pending, processing, completed, successful, failed.
+     * @param int $offset An optional start offset.
+     * @param bool $recentFirst Weather to search recent jobs first.
+     * @return array The jobs information.
+     */
+    public static function filterJobs(?string $expression=null, int $offset=0, bool $recentFirst=false):array{
+        $response = ['success'=>false];
+
         if(is_string($expression) && !preg_match('/^(?=.+)[a-zA-Z_$()!][a-zA-Z0-9_\[\].\s$(),"\'&|!<>=+-]*$/', $expression)){
-            return false;
+            $response['error'] = "Invalid filter expression";
+            return $response;
         }
 
         $jobs = self::loadJobs();
+        if(!is_array($jobs)){
+            mklog(2, "Failed to read jobs file");
+            $response['error'] = "Could not read jobs file";
+            return $response;
+        }
 
         $filtered = [];
         $matches = 0;
@@ -249,55 +124,50 @@ class conductor_server{
                         }
                     }
                 }
+                else{
+                    $filtered[] = $job;
+                }
             }
             catch(\Error){
                 continue;
             }
         }
 
-        if(is_string($expression)){
-            return [
-                'jobs' => $filtered,
-                'matches' => $matches,
-                'totals' => $totals
-            ];
-        }
-        else{
-            return $totals;
-        }
+        $response['success'] = true;
+        $response['jobs'] = $filtered;
+        $response['matches'] = $matches;
+        $response['totals'] = $totals;
+        return $response;
     }
 
-    private static function getJob(string $name, $data, &$jobs, &$response):bool{
-        if(!is_array($data)){
-            $response['error'] = "Data is not an array";
-            return false;
-        }
-        if(!isset($data['abilities'])){
-            $response['error'] = "abilities list not present";
-            return false;
-        }
-        if(!is_array($data['abilities'])){
-            $response['error'] = "abilities list is not an array";
-            return false;
-        }
-        if(count($data['abilities']) < 1){
-            $response['error'] = "abilities list is empty";
-            return false;
-        }
-        foreach($data['abilities'] as $ability => $abilityVersion){
-            if(!pkgmgr::validatePackageId($ability)){
-                $response['error'] = "ability package id is invalid: " . $ability;
-                return false;
+    /**
+     * Gets the next available job.
+     * @param string $name The name of the requester.
+     * @param array $installedPackages An array of installed packages and their versions.
+     * @return array The response with a success and job key if successful, the job array contains all the job information.
+     */
+    public static function getJob(array $installedPackages):array{
+        $response = ['success'=>false];
+
+        foreach($installedPackages as $packageName => $packageVersion){
+            if(!pkgmgr::validatePackageId($packageName)){
+                $response['error'] = "ability package id is invalid: " . $packageName;
+                return $response;
             }
-            if(!is_int($abilityVersion)){
-                $response['error'] = "ability package version is not an integer: " . $abilityVersion;
-                return false;
-            }
-            if($abilityVersion < 1){
-                $response['error'] = "ability package version is invalid: " . $abilityVersion;
-                return false;
+            if(!is_int($packageVersion) || $packageVersion < 1){
+                $response['error'] = "ability package version is invalid: " . $packageName . ":" . $packageVersion;
+                return $response;
             }
         }
+
+        $jobs = self::loadJobs();
+        if(!is_array($jobs)){
+            mklog(2, "Failed to read jobs file");
+            $response['error'] = "Could not read jobs file";
+            return $response;
+        }
+
+        $name = communicator::getLastReceivedName();
 
         $availableJob = null;
         foreach($jobs as $job){
@@ -305,213 +175,226 @@ class conductor_server{
                 continue;
             }
 
-            if(isset($job['target'])){
+            if(is_string($job['target'])){
                 if($job['target'] !== $name){
                     continue;
                 }
             }
 
+            $requirementsMet = true;
             foreach($job['requirements'] as $requirement => $requirementVersion){
-                if(!isset($data['abilities'][$requirement])){
+                if(($installedPackages[$requirement] ?? 0) < $requirementVersion){
+                    $requirementsMet = false;
                     continue;
                 }
-                if($data['abilities'][$requirement] < $requirementVersion){
-                    continue;
-                }
+            }
+            if(!$requirementsMet){
+                continue;
             }
             
             $availableJob = $job;
             break;
         }
 
-        if($availableJob === null){
+        
+
+        if(!is_array($availableJob)){
             $response['message'] = "No jobs available";
+            $response['success'] = true;
+            return $response;
         }
-        else{
-            $response['job'] = $availableJob;
-
-            $requestedId = $response['job']['id'];
-            foreach($jobs as $jobindex => $job){
-                if($job['id'] === $requestedId){
-                    $jobs[$jobindex]['requested'] = true;
-                    $jobs[$jobindex]['request_time'] = time();
-                    break;
-                }
-            }
-        }
-
-        $response['success'] = true;
-        return true;
-    }
-    private static function updateJob($jobData, &$jobs, &$response):bool{
-        if(!is_array($jobData)){
-            $response['error'] = "jobdata is not an array";
-            return false;
-        }
-
-        if(!isset($jobData['id'])){
-            $response['error'] = "job id not set";
-            return false;
-        }
-        if(!is_string($jobData['id'])){
-            $response['error'] = "job id not a string";
-            return false;
-        }
-
-        if(!isset($jobData['return'])){
-            $response['error'] = "return not set";
-            return false;
-        }
-
-        if(!isset($jobData['error_completing'])){
-            $response['error'] = "error_completing not set";
-            return false;
-        }
-        if(!is_bool($jobData['error_completing'])){
-            $response['error'] = "error_completing not a boolean";
-            return false;
-        }
-
-        $foundJob = false;
+        
+        $response['job'] = $availableJob;
+        $requestedId = $response['job']['id'];
         foreach($jobs as $jobindex => $job){
-            if($job['id'] === $jobData['id']){
-                if($job['requested'] !== true){
-                    $response['error'] = "Job " . $jobData['id'] . " has not been requested";
-                    return false;
-                }
-                if($job['completed'] !== false){
-                    $response['error'] = "Job already completed";
-                    return false;
-                }
-
-                $jobs[$jobindex]['return'] = $jobData['return'];
-                $jobs[$jobindex]['error_completing'] = $jobData['error_completing'];
-                $jobs[$jobindex]['completed'] = true;
-                $jobs[$jobindex]['completion_time'] = time();
-
-                // finish function
-                if(isset($jobs[$jobindex]['finish_function'])){
-                    if(is_string($jobs[$jobindex]['finish_function'])){
-                        $return = null;
-                        $error = false;
-                        try{
-                            echo "Executing finish function: " . $jobs[$jobindex]['finish_function'] . "\n";
-                            $return = eval('return ' . $jobs[$jobindex]['finish_function'] . ';');
-                        }
-                        catch(Throwable $throwable){
-                            $error = true;
-                            $return = null;
-                            mklog("warning", "Error running finish function: " . $jobs[$jobindex]['finish_function'] . ": " . explode("\n",$throwable)[0] . "\n", false);
-                        }
-
-                        $jobs[$jobindex]['finish_function_return'] = $return;
-                        $jobs[$jobindex]['finish_function_error'] = $error;
-                    }
-                    else{
-                        echo "Finish function is not a string\n";
-                    }
-                }
-                /////
-
-                $foundJob = true;
+            if($job['id'] === $requestedId){
+                $jobs[$jobindex]['requested'] = true;
+                $jobs[$jobindex]['request_time'] = time();
                 break;
             }
         }
 
-        if(!$foundJob){
-            $response['error'] = "Job " . $jobData['id'] . " not found";
-            return false;
+        if(!self::saveJobs($jobs)){
+            mklog(2, "Failed to save jobs file");
+            return [
+                'success'=> false,
+                'error' => "Failed to save updated job information"
+            ];
         }
+
+        mklog(1, "Sent job " . $response['job']['id'] . " to " . $name);
 
         $response['success'] = true;
-        return true;
+        return $response;
     }
-    private static function addJob($jobData, &$jobs, &$response):bool{
-        if(!is_array($jobData)){
-            $response['error'] = "Job data is not an array";
-            return false;
-        }
-        $required = array("requirements","action_type","action");
-        foreach($required as $require){
-            if(!isset($jobData[$require])){
-                $response['error'] = $require . " data not present";
-                return false;
-            }
-        }
+    /**
+     * Marks a requested job as finished.
+     * @param string $jobId The job id to set to finished.
+     * @param mixed $jobReturn The return of the job action.
+     * @param bool $errorCompletingJob Weather there was an error completing the job.
+     * @return array An array containing a success key and an error key for error messages on failure.
+     */
+    public static function finishJob(string $jobId, mixed $jobReturn, bool $errorCompletingJob):array{
+        $response = ['success'=>false];
 
-        $job['id'] = (string) time::millistamp();
-
-        if(!is_array($jobData['requirements'])){
-            $response['error'] = "requirements data is not an array";
-            return false;
-        }
-        foreach($jobData['requirements'] as $requirement => $version){
-            if(!pkgmgr::validatePackageId($requirement)){
-                $response['error'] = "requirement package id is invalid: " . $requirement;
-                return false;
-            }
-            if(!is_int($version) || $version < 1){
-                $response['error'] = "requirement package version for " . $requirement . " is invalid: " . $version;
-                return false;
-            }
-        }
-        $job['requirements'] = $jobData['requirements'];
-
-        if(isset($jobData['target'])){
-            if(is_string($jobData['target'])){
-                $job['target'] = $jobData['target'];
-            }
-        }
-
-        if(!is_string($jobData['action_type'])){
-            $response['error'] = "action_type data is not a string";
-            return false;
-        }
-        $types = array("function_string");
-        if(!in_array($jobData['action_type'],$types)){
-            $response['error'] = "action_type is not a recognised type";
-            return false;
-        }
-        $job['action_type'] = $jobData['action_type'];
-
-        if(!is_string($jobData['action'])){
-            $response['error'] = "action is not a string";
-            return false;
-        }
-        $job['action'] = $jobData['action'];
-
-        $job['return'] = null;
-        $job['completed'] = false;
-        $job['requested'] = false;
-        $job['error_completing'] = false;
-        $job['request_time'] = null;
-        $job['completion_time'] = null;
-
-        if(isset($jobData['finish_function'])){
-            if(is_string($jobData['finish_function'])){
-                $job['finish_function'] = $jobData['finish_function'];
-                $job['finish_function_return'] = null;
-                $job['finish_function_error'] = false;
-            }
-        }
-
+        $jobs = self::loadJobs();
         if(!is_array($jobs)){
-            $response['error'] = "main jobs list is corrupted";
-            return false;
+            mklog(2, "Failed to read jobs file");
+            $response['error'] = "Could not read jobs file";
+            return $response;
         }
+
+        foreach($jobs as &$job){
+            if($job['id'] !== $jobId){
+                continue;
+            }
+
+            if($job['requested'] !== true){
+                $response['error'] = "Job has not been requested yet";
+                return $response;
+            }
+            if($job['completed'] !== false){
+                $response['error'] = "Job already completed";
+                return $response;
+            }
+
+            $job['return'] = $jobReturn;
+            $job['error_completing'] = $errorCompletingJob;
+            $job['completed'] = true;
+            $job['completion_time'] = time();
+
+            if(isset($job['finish_function'])){
+                if(is_string($job['finish_function']) && !empty($job['finish_function'])){
+                    $finishReturn = null;
+                    $finishError = false;
+                    try{
+                        mklog(1, "Running finish function for job " . $job['id']);
+                        $finishReturn = eval('return ' . $job['finish_function'] . ';');
+                    }
+                    catch(Throwable $throwable){
+                        $finishError = true;
+                        $finishReturn = null;
+                        mklog(2, "Error running finish function for job " . $job['id'] . ": " . explode("\n",$throwable)[0] . "\n");
+                    }
+
+                    $job['finish_function_return'] = $finishReturn;
+                    $job['finish_function_error'] = $finishError;
+                }
+                else{
+                    mklog(2, "Finish function for job " . $job['id'] . " is set but not valid");
+                }
+            }
+
+            if(!self::saveJobs($jobs)){
+                mklog(2, "Failed to save jobs file");
+                return [
+                    'success'=> false,
+                    'error' => "Failed to save updated job information"
+                ];
+            }
+
+            mklog(1, "Job " . $jobId . " completed");
+
+            $response['success'] = true;
+            return $response;
+        }
+        unset($job);
+
+        return [
+            'success'=> false,
+            'error' => "Job not found"
+        ];
+    }
+    /**
+     * Creates a job.
+     * @param string $function The function string to be run.
+     * @param array $requirements A list of required packages and package versions.
+     * @param null|string $finishFunction An optional finish function the server runs when a job is completed.
+     * @param null|string $target An optional target machine to send the job to.
+     * @return array An array containing success boolean and a job id on success or error message on failure.
+     */
+    public static function addJob(string $function, array $requirements, ?string $finishFunction, ?string $target):array{
+        $response = ['success'=>false];
+
+        $job = [
+            'id' => (string) floor(microtime(true)*1000),
+            'completed' => false,
+            'requested' => false,
+            'requirements' => [],
+            'target' => null,
+            'action' => null,
+            'return' => null,
+            'error_completing' => null,
+            'finish_function' => null,
+            'finish_function_return' => null,
+            'finish_function_error' => null
+        ];
+        
+        if(empty(trim($function))){
+            $response['error'] = "Function is empty";
+            return $response;
+        }
+        $job['action'] = $function;
+
+        if(is_string($finishFunction)){
+            if(empty(trim($function))){
+                $response['error'] = "Finish function is set but is empty";
+                return $response;
+            }
+            $job['finish_function'] = $finishFunction;
+        }
+
+        foreach($requirements as $requirement => $version){
+            if(!is_string($requirement) || empty(trim($requirement)) || !is_int($version) || $version < 1){
+                $response['error'] = "Invalid requirements data";
+                return $response;
+            }
+            if(!pkgmgr::validatePackageId($requirement)){
+                $response['error'] = "Requirement package id is invalid: " . $requirement;
+                return $response;
+            }
+        }
+        $job['requirements'] = $requirements;
+
+        if(is_string($target)){
+            if(empty(trim($target))){
+                $response['error'] = "Invalid target";
+                return $response;
+            }
+            $job['target'] = $target;
+        }
+
+        $jobs = self::loadJobs();
+        if(!is_array($jobs)){
+            mklog(2, "Failed to read jobs file");
+            $response['error'] = "Could not read jobs file";
+            return $response;
+        }
+        
         $jobs[] = $job;
+
+        if(!self::saveJobs($jobs)){
+            mklog(2, "Failed to save jobs file");
+            return [
+                'success'=> false,
+                'error' => "Failed to save updated job information"
+            ];
+        }
+
+        mklog(1, "Job " . $job['id'] . " created");
 
         $response['job_id'] = $job['id'];
         $response['success'] = true;
-        return true;
+        return $response;
     }
-    private static function loadJobs():array{
+
+    private static function loadJobs():?array{
         $jobsFile = self::jobsFile();
         $json = json::readFile($jobsFile,false);
         if(is_array($json)){
             return $json;
         }
-        return array();
+        return null;
     }
     private static function saveJobs(array $jobs):bool{
         $jobsFile = self::jobsFile();
@@ -519,9 +402,59 @@ class conductor_server{
     }
     private static function jobsFile():string{
         $setting = settings::read("jobsFile");
-        if(is_string($setting)){
+        if(is_string($setting) && !empty($setting)){
             return $setting;
         }
         return "conductor\\jobs.json";
+    }
+
+    public static function communicatorServerActions():array{
+        return [
+            "getJob" => [
+                "function" => "conductor_server::getJob",
+                "args" => [
+                    "--0"
+                ]
+            ],
+            "finishJob" => [
+                "function" => "conductor_server::finishJob",
+                "args" => [
+                    "--0",
+                    "--1",
+                    "--2"
+                ]
+            ],
+            "addJob" => [
+                "function" => "conductor_server::addJob",
+                "args" => [
+                    "--0",
+                    "--1",
+                    "--2",
+                    "--3"
+                ]
+            ],
+            "filterJobs" => [
+                "function" => "conductor_server::filterJobs",
+                "args" => [
+                    "--0",
+                    "--1",
+                    "--2"
+                ],
+                "defArgs" => [
+                    0 => null,
+                    1 => 0,
+                    2 => false,
+                ]
+            ],
+            "getJobTimes" => [
+                "function" => "conductor_server::getJobTimes",
+                "args" => [
+                    "--0"
+                ],
+                "defArgs" => [
+                    0 => 5
+                ]
+            ],
+        ];
     }
 }
