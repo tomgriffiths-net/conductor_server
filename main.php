@@ -2,6 +2,14 @@
 class conductor_server{
     public static function init(){
         settings::set("jobsFile", "conductor\\jobs.json", false);
+
+        $jobsFile = settings::read('jobsFile');
+        if(!is_string($jobsFile) || empty($jobsFile)){
+            mklog(2, "Invalid jobs file configured");
+        }
+        elseif(!is_file($jobsFile)){
+            files::mkFile($jobsFile, "[]", "w", false);
+        }
     }
 
     /**

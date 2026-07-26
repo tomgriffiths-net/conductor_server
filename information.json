@@ -1,7 +1,7 @@
 {
     "id_name": "conductor_server",
     "name": "Conductor Server (Dev)",
-    "version": 11,
+    "version": 12,
     "author": "tom",
     "description": "",
     "dependencies": {
