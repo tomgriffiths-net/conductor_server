@@ -1,5 +1,7 @@
 <?php
 class conductor_server{
+    private static array $jobs = [];
+    private static bool $jobsModified = false;
     public static function init(){
         settings::set("jobsFile", "conductor\\jobs.json", false);
 
@@ -83,12 +85,7 @@ class conductor_server{
             return $response;
         }
 
-        $jobs = self::loadJobs();
-        if(!is_array($jobs)){
-            mklog(2, "Failed to read jobs file");
-            $response['error'] = "Could not read jobs file";
-            return $response;
-        }
+        $jobs = self::$jobs;
 
         $filtered = [];
         $matches = 0;
@@ -156,6 +153,7 @@ class conductor_server{
      */
     public static function getJob(array $installedPackages):array{
         $response = ['success'=>false];
+        self::$jobsModified = true;
 
         foreach($installedPackages as $packageName => $packageVersion){
             if(!pkgmgr::validatePackageId($packageName)){
@@ -168,17 +166,10 @@ class conductor_server{
             }
         }
 
-        $jobs = self::loadJobs();
-        if(!is_array($jobs)){
-            mklog(2, "Failed to read jobs file");
-            $response['error'] = "Could not read jobs file";
-            return $response;
-        }
-
         $name = communicator::getLastReceivedName();
 
         $availableJob = null;
-        foreach($jobs as $job){
+        foreach(self::$jobs as $job){
             if($job['completed'] !== false || $job['requested'] !== false || $job['return'] !== null){
                 continue;
             }
@@ -204,8 +195,6 @@ class conductor_server{
             break;
         }
 
-        
-
         if(!is_array($availableJob)){
             $response['message'] = "No jobs available";
             $response['success'] = true;
@@ -214,25 +203,19 @@ class conductor_server{
         
         $response['job'] = $availableJob;
         $requestedId = $response['job']['id'];
-        foreach($jobs as $jobindex => $job){
+        foreach(self::$jobs as &$job){
             if($job['id'] === $requestedId){
-                $jobs[$jobindex]['requested'] = true;
-                $jobs[$jobindex]['request_time'] = time();
+                $job['requested'] = true;
+                $job['requested_by'] = $name;
+                $job['request_time'] = time();
                 break;
             }
-        }
-
-        if(!self::saveJobs($jobs)){
-            mklog(2, "Failed to save jobs file");
-            return [
-                'success'=> false,
-                'error' => "Failed to save updated job information"
-            ];
         }
 
         mklog(1, "Sent job " . $response['job']['id'] . " to " . $name);
 
         $response['success'] = true;
+        self::$jobsModified = true;
         return $response;
     }
     /**
@@ -245,14 +228,7 @@ class conductor_server{
     public static function finishJob(string $jobId, mixed $jobReturn, bool $errorCompletingJob):array{
         $response = ['success'=>false];
 
-        $jobs = self::loadJobs();
-        if(!is_array($jobs)){
-            mklog(2, "Failed to read jobs file");
-            $response['error'] = "Could not read jobs file";
-            return $response;
-        }
-
-        foreach($jobs as &$job){
+        foreach(self::$jobs as &$job){
             if($job['id'] !== $jobId){
                 continue;
             }
@@ -263,6 +239,10 @@ class conductor_server{
             }
             if($job['completed'] !== false){
                 $response['error'] = "Job already completed";
+                return $response;
+            }
+            if($job['requested_by'] !== communicator::getLastReceivedName()){
+                $response['error'] = "You did not request this job";
                 return $response;
             }
 
@@ -293,17 +273,10 @@ class conductor_server{
                 }
             }
 
-            if(!self::saveJobs($jobs)){
-                mklog(2, "Failed to save jobs file");
-                return [
-                    'success'=> false,
-                    'error' => "Failed to save updated job information"
-                ];
-            }
-
             mklog(1, "Job " . $jobId . " completed");
 
             $response['success'] = true;
+            self::$jobsModified = true;
             return $response;
         }
         unset($job);
@@ -372,41 +345,34 @@ class conductor_server{
             $job['target'] = $target;
         }
 
-        $jobs = self::loadJobs();
-        if(!is_array($jobs)){
-            mklog(2, "Failed to read jobs file");
-            $response['error'] = "Could not read jobs file";
-            return $response;
-        }
-        
-        $jobs[] = $job;
-
-        if(!self::saveJobs($jobs)){
-            mklog(2, "Failed to save jobs file");
-            return [
-                'success'=> false,
-                'error' => "Failed to save updated job information"
-            ];
-        }
+        self::$jobs[] = $job;
 
         mklog(1, "Job " . $job['id'] . " created");
 
         $response['job_id'] = $job['id'];
         $response['success'] = true;
+        self::$jobsModified = true;
         return $response;
     }
 
-    private static function loadJobs():?array{
+    public  static function loadJobs():bool{
         $jobsFile = self::jobsFile();
         $json = json::readFile($jobsFile,false);
         if(is_array($json)){
-            return $json;
+            self::$jobs = $json;
         }
-        return null;
+        return false;
     }
-    private static function saveJobs(array $jobs):bool{
-        $jobsFile = self::jobsFile();
-        return json::writeFile($jobsFile,$jobs,true);
+    public  static function saveJobs():bool{
+        if(!self::$jobsModified){
+            return true;
+        }
+
+        if(json::writeFile(self::jobsFile(), self::$jobs, true)){
+            self::$jobsModified = false;
+            return true;
+        }
+        return false;
     }
     private static function jobsFile():string{
         $setting = settings::read("jobsFile");
@@ -462,6 +428,23 @@ class conductor_server{
                 "defArgs" => [
                     0 => 5
                 ]
+            ],
+        ];
+    }
+    public static function communicatorServerThingsToDo():array{
+        return [
+            [
+                "type" => "startup",
+                "function" => 'conductor_server::loadJobs()'
+            ],
+            [
+                "type" => "repeat",
+                "interval" => 10,
+                "function" => 'conductor_server::saveJobs()'
+            ],
+            [
+                "type" => "shutdown",
+                "function" => 'conductor_server::saveJobs()'
             ],
         ];
     }
